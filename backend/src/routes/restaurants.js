@@ -1,5 +1,5 @@
 const express = require('express');
-const { query } = require('../db/pool');
+const { pool } = require('../db/pool');
 const { asyncHandler } = require('../middleware/error');
 const { requireOwner } = require('../middleware/auth');
 
