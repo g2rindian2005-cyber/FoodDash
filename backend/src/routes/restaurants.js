@@ -5,31 +5,56 @@ const { requireOwner } = require('../middleware/auth');
 
 const router = express.Router();
 
-// GET /api/restaurants  (optional ?search=)
+// GET /api/restaurants
 router.get('/', asyncHandler(async (req, res) => {
   const { search } = req.query;
+
   let sql = 'SELECT * FROM restaurants';
   const params = [];
+
   if (search) {
     params.push(`%${search}%`);
     sql += ` WHERE name ILIKE $1 OR cuisine ILIKE $1`;
   }
+
   sql += ' ORDER BY rating DESC, id ASC';
-  const { rows } = await query(sql, params);
+
+  const { rows } = await pool.query(sql, params);
+
   res.json(rows);
 }));
 
-// GET /api/restaurants/:id  -> restaurant + its menu grouped nothing, just details
+// GET /api/restaurants/:id
 router.get('/:id', asyncHandler(async (req, res) => {
-  const { rows } = await query('SELECT * FROM restaurants WHERE id = $1', [req.params.id]);
-  if (!rows.length) return res.status(404).json({ message: 'Restaurant not found.' });
+  const { rows } = await pool.query(
+    'SELECT * FROM restaurants WHERE id = $1',
+    [req.params.id]
+  );
+
+  if (!rows.length) {
+    return res.status(404).json({
+      message: 'Restaurant not found.'
+    });
+  }
+
   res.json(rows[0]);
 }));
 
-// PUT /api/restaurants/:id  (owner) -> update details / offer / open status
+// PUT /api/restaurants/:id
 router.put('/:id', requireOwner, asyncHandler(async (req, res) => {
-  const { name, description, cuisine, image_url, delivery_time, price_for_two, address, is_open, offer_text } = req.body;
-  const { rows } = await query(
+  const {
+    name,
+    description,
+    cuisine,
+    image_url,
+    delivery_time,
+    price_for_two,
+    address,
+    is_open,
+    offer_text
+  } = req.body;
+
+  const { rows } = await pool.query(
     `UPDATE restaurants SET
        name          = COALESCE($1, name),
        description   = COALESCE($2, description),
@@ -42,20 +67,44 @@ router.put('/:id', requireOwner, asyncHandler(async (req, res) => {
        offer_text    = COALESCE($9, offer_text)
      WHERE id = $10
      RETURNING *`,
-    [name, description, cuisine, image_url, delivery_time, price_for_two, address, is_open, offer_text, req.params.id]
+    [
+      name,
+      description,
+      cuisine,
+      image_url,
+      delivery_time,
+      price_for_two,
+      address,
+      is_open,
+      offer_text,
+      req.params.id
+    ]
   );
-  if (!rows.length) return res.status(404).json({ message: 'Restaurant not found.' });
+
+  if (!rows.length) {
+    return res.status(404).json({
+      message: 'Restaurant not found.'
+    });
+  }
+
   res.json(rows[0]);
 }));
 
-// PATCH /api/restaurants/:id/status  (owner) -> quick open/close toggle
+// PATCH /api/restaurants/:id/status
 router.patch('/:id/status', requireOwner, asyncHandler(async (req, res) => {
   const { is_open } = req.body;
-  const { rows } = await query(
+
+  const { rows } = await pool.query(
     'UPDATE restaurants SET is_open = $1 WHERE id = $2 RETURNING *',
     [Boolean(is_open), req.params.id]
   );
-  if (!rows.length) return res.status(404).json({ message: 'Restaurant not found.' });
+
+  if (!rows.length) {
+    return res.status(404).json({
+      message: 'Restaurant not found.'
+    });
+  }
+
   res.json(rows[0]);
 }));
 
