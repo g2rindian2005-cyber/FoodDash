@@ -22,7 +22,7 @@ env:
   APP_DIR: /var/www/fooddash
 
 jobs:
-  # ------------------------------------------------------------------
+  # ==================================================================
   build:
     name: Build backend + frontend
     runs-on: ubuntu-latest
@@ -57,7 +57,7 @@ jobs:
           path: frontend/dist
           if-no-files-found: error
 
-  # ------------------------------------------------------------------
+  # ==================================================================
   setup-server:
     name: One-time server setup (manual)
     needs: build
@@ -72,7 +72,12 @@ jobs:
           mkdir -p ~/.ssh
           printf '%s\n' "$EC2_SSH_KEY" > ~/.ssh/id_rsa
           chmod 600 ~/.ssh/id_rsa
-          ssh-keyscan -H "$EC2_HOST" >> ~/.ssh/known_hosts
+          printf 'Host *\n  StrictHostKeyChecking no\n  UserKnownHostsFile /dev/null\n  ConnectTimeout 20\n' > ~/.ssh/config
+          if ! timeout 25 bash -c "echo > /dev/tcp/$EC2_HOST/22"; then
+            echo "::error::Cannot reach port 22 on EC2. Open port 22 to 0.0.0.0/0 in the security group and check the EC2_HOST secret."
+            exit 1
+          fi
+          echo "Port 22 reachable"
 
       - name: Bootstrap Amazon Linux
         env:
@@ -188,7 +193,7 @@ jobs:
           echo "Server setup done"
           REMOTE
 
-  # ------------------------------------------------------------------
+  # ==================================================================
   deploy:
     name: Deploy to EC2
     needs: [build, setup-server]
@@ -212,7 +217,12 @@ jobs:
           mkdir -p ~/.ssh
           printf '%s\n' "$EC2_SSH_KEY" > ~/.ssh/id_rsa
           chmod 600 ~/.ssh/id_rsa
-          ssh-keyscan -H "$EC2_HOST" >> ~/.ssh/known_hosts
+          printf 'Host *\n  StrictHostKeyChecking no\n  UserKnownHostsFile /dev/null\n  ConnectTimeout 20\n' > ~/.ssh/config
+          if ! timeout 25 bash -c "echo > /dev/tcp/$EC2_HOST/22"; then
+            echo "::error::Cannot reach port 22 on EC2. Open port 22 to 0.0.0.0/0 in the security group and check the EC2_HOST secret."
+            exit 1
+          fi
+          echo "Port 22 reachable"
 
       - name: Prepare server directories
         env:
@@ -220,7 +230,7 @@ jobs:
           EC2_HOST: ${{ secrets.EC2_HOST }}
         run: |
           ssh -i ~/.ssh/id_rsa "$EC2_USER@$EC2_HOST" \
-            "sudo mkdir -p $APP_DIR/backend $APP_DIR/frontend/dist && sudo chown -R \$(whoami):\$(whoami) $APP_DIR && command -v rsync >/dev/null || sudo dnf install -y rsync"
+            "sudo mkdir -p $APP_DIR/backend $APP_DIR/frontend/dist && sudo chown -R \$(whoami):\$(whoami) $APP_DIR && (command -v rsync >/dev/null || sudo dnf install -y rsync)"
 
       - name: Upload backend + frontend
         env:
@@ -266,7 +276,7 @@ jobs:
           exit 1
           REMOTE
 
-  # ------------------------------------------------------------------
+  # ==================================================================
   init-database:
     name: One-time DB migrate + seed (manual)
     needs: deploy
@@ -281,7 +291,12 @@ jobs:
           mkdir -p ~/.ssh
           printf '%s\n' "$EC2_SSH_KEY" > ~/.ssh/id_rsa
           chmod 600 ~/.ssh/id_rsa
-          ssh-keyscan -H "$EC2_HOST" >> ~/.ssh/known_hosts
+          printf 'Host *\n  StrictHostKeyChecking no\n  UserKnownHostsFile /dev/null\n  ConnectTimeout 20\n' > ~/.ssh/config
+          if ! timeout 25 bash -c "echo > /dev/tcp/$EC2_HOST/22"; then
+            echo "::error::Cannot reach port 22 on EC2. Open port 22 to 0.0.0.0/0 in the security group and check the EC2_HOST secret."
+            exit 1
+          fi
+          echo "Port 22 reachable"
 
       - name: Migrate + seed
         env:
@@ -291,7 +306,7 @@ jobs:
           ssh -i ~/.ssh/id_rsa "$EC2_USER@$EC2_HOST" \
             "cd $APP_DIR/backend && npm run migrate && npm run seed"
 
-  # ------------------------------------------------------------------
+  # ==================================================================
   verify:
     name: Public health check
     needs: [deploy, init-database]
