@@ -1,9 +1,18 @@
-name: CI/CD - Deploy FoodDash to AWS EC2
+name: CI/CD - FoodDash to AWS EC2
 
 on:
   push:
     branches: [main]
   workflow_dispatch:
+    inputs:
+      setup_server:
+        description: "FIRST TIME ONLY: install Node, Nginx, Postgres, PM2 and create .env"
+        type: boolean
+        default: false
+      init_database:
+        description: "FIRST TIME ONLY: migrate + seed DB (migrate DELETES all data!)"
+        type: boolean
+        default: false
 
 concurrency:
   group: deploy-production
@@ -13,8 +22,9 @@ env:
   APP_DIR: /var/www/fooddash
 
 jobs:
+  # ------------------------------------------------------------------
   build:
-    name: Build & test
+    name: Build backend + frontend
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -41,25 +51,158 @@ jobs:
           if [ -f package-lock.json ]; then npm ci; else npm install; fi
           npm run build
 
-      - name: Upload frontend build
-        uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v4
         with:
           name: frontend-dist
           path: frontend/dist
           if-no-files-found: error
 
-  deploy:
-    name: Deploy to EC2
+  # ------------------------------------------------------------------
+  setup-server:
+    name: One-time server setup (manual)
     needs: build
+    if: ${{ inputs.setup_server }}
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - name: Set up SSH
+        env:
+          EC2_SSH_KEY: ${{ secrets.EC2_SSH_KEY }}
+          EC2_HOST: ${{ secrets.EC2_HOST }}
+        run: |
+          mkdir -p ~/.ssh
+          printf '%s\n' "$EC2_SSH_KEY" > ~/.ssh/id_rsa
+          chmod 600 ~/.ssh/id_rsa
+          ssh-keyscan -H "$EC2_HOST" >> ~/.ssh/known_hosts
 
-      - name: Download frontend build
-        uses: actions/download-artifact@v4
+      - name: Bootstrap Amazon Linux
+        env:
+          EC2_USER: ${{ secrets.EC2_USER }}
+          EC2_HOST: ${{ secrets.EC2_HOST }}
+        run: |
+          ssh -i ~/.ssh/id_rsa "$EC2_USER@$EC2_HOST" "PUBLIC_IP='$EC2_HOST' bash -s" <<'REMOTE'
+          set -euo pipefail
+          cd /tmp
+          APP_DIR=/var/www/fooddash
+          DB_NAME=fooddb
+          DB_USER=fooduser
+          ENV_FILE="$APP_DIR/backend/.env"
+
+          echo "==> Packages"
+          sudo dnf install -y nginx rsync git openssl postgresql15 postgresql15-server
+          if ! command -v node >/dev/null || [ "$(node -v | cut -d. -f1 | tr -d v)" -lt 20 ]; then
+            curl -fsSL https://rpm.nodesource.com/setup_20.x | sudo bash -
+            sudo dnf install -y nodejs
+          fi
+          command -v pm2 >/dev/null || sudo npm install -g pm2
+
+          echo "==> Directories"
+          sudo mkdir -p $APP_DIR/backend $APP_DIR/frontend/dist
+          sudo chown -R "$(whoami)":"$(whoami)" $APP_DIR
+          sudo chmod 755 $APP_DIR
+
+          echo "==> PostgreSQL"
+          if [ ! -f /var/lib/pgsql/data/PG_VERSION ]; then
+            sudo postgresql-setup --initdb
+          fi
+          sudo sed -i -E 's/^(host\s+all\s+all\s+(127\.0\.0\.1\/32|::1\/128)\s+)ident/\1scram-sha-256/' /var/lib/pgsql/data/pg_hba.conf
+          sudo systemctl enable --now postgresql
+          sudo systemctl restart postgresql
+
+          if [ -f "$ENV_FILE" ]; then
+            DB_PASS=$(grep '^PGPASSWORD=' "$ENV_FILE" | cut -d= -f2-)
+          else
+            DB_PASS=$(openssl rand -hex 16)
+          fi
+          if sudo -u postgres psql -tAc "SELECT 1 FROM pg_roles WHERE rolname='$DB_USER'" | grep -q 1; then
+            sudo -u postgres psql -c "ALTER USER $DB_USER WITH PASSWORD '$DB_PASS';"
+          else
+            sudo -u postgres psql -c "CREATE USER $DB_USER WITH PASSWORD '$DB_PASS';"
+          fi
+          if ! sudo -u postgres psql -tAc "SELECT 1 FROM pg_database WHERE datname='$DB_NAME'" | grep -q 1; then
+            sudo -u postgres psql -c "CREATE DATABASE $DB_NAME OWNER $DB_USER;"
+          fi
+
+          echo "==> backend .env"
+          if [ ! -f "$ENV_FILE" ]; then
+            cat > "$ENV_FILE" <<ENVEOF
+          PORT=5000
+          NODE_ENV=production
+          CLIENT_ORIGIN=http://$PUBLIC_IP
+          PGHOST=localhost
+          PGPORT=5432
+          PGUSER=$DB_USER
+          PGPASSWORD=$DB_PASS
+          PGDATABASE=$DB_NAME
+          PGSSLMODE=disable
+          JWT_SECRET=$(openssl rand -hex 32)
+          JWT_EXPIRES_IN=7d
+          UPI_MERCHANT_VPA=fooddash@upi
+          UPI_MERCHANT_NAME=FoodDash
+          ENVEOF
+            chmod 600 "$ENV_FILE"
+          fi
+
+          echo "==> Nginx"
+          [ -f /etc/nginx/nginx.conf.orig ] || sudo cp /etc/nginx/nginx.conf /etc/nginx/nginx.conf.orig
+          sudo tee /etc/nginx/nginx.conf >/dev/null <<'NGINXMAIN'
+          user nginx;
+          worker_processes auto;
+          error_log /var/log/nginx/error.log;
+          pid /run/nginx.pid;
+          events { worker_connections 1024; }
+          http {
+              include       /etc/nginx/mime.types;
+              default_type  application/octet-stream;
+              access_log    /var/log/nginx/access.log;
+              sendfile      on;
+              keepalive_timeout 65;
+              include /etc/nginx/conf.d/*.conf;
+          }
+          NGINXMAIN
+          sudo tee /etc/nginx/conf.d/fooddash.conf >/dev/null <<'NGINXSITE'
+          server {
+              listen 80 default_server;
+              server_name _;
+              root /var/www/fooddash/frontend/dist;
+              index index.html;
+              location / {
+                  try_files $uri $uri/ /index.html;
+              }
+              location /api/ {
+                  proxy_pass http://127.0.0.1:5000;
+                  proxy_http_version 1.1;
+                  proxy_set_header Host $host;
+                  proxy_set_header X-Real-IP $remote_addr;
+                  proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+                  proxy_set_header X-Forwarded-Proto $scheme;
+              }
+          }
+          NGINXSITE
+          sudo nginx -t
+          sudo systemctl enable --now nginx
+          sudo systemctl restart nginx
+
+          echo "==> PM2 auto-start on reboot"
+          sudo env PATH="$PATH:/usr/bin" "$(command -v pm2)" startup systemd -u "$(whoami)" --hp "$HOME"
+
+          echo "Server setup done"
+          REMOTE
+
+  # ------------------------------------------------------------------
+  deploy:
+    name: Deploy to EC2
+    needs: [build, setup-server]
+    if: ${{ !cancelled() && needs.build.result == 'success' && (needs.setup-server.result == 'success' || needs.setup-server.result == 'skipped') }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
         with:
           name: frontend-dist
           path: frontend/dist
+
+      - uses: actions/checkout@v4
+        with:
+          path: src
 
       - name: Set up SSH
         env:
@@ -71,7 +214,15 @@ jobs:
           chmod 600 ~/.ssh/id_rsa
           ssh-keyscan -H "$EC2_HOST" >> ~/.ssh/known_hosts
 
-      - name: Upload files to EC2
+      - name: Prepare server directories
+        env:
+          EC2_USER: ${{ secrets.EC2_USER }}
+          EC2_HOST: ${{ secrets.EC2_HOST }}
+        run: |
+          ssh -i ~/.ssh/id_rsa "$EC2_USER@$EC2_HOST" \
+            "sudo mkdir -p $APP_DIR/backend $APP_DIR/frontend/dist && sudo chown -R \$(whoami):\$(whoami) $APP_DIR && command -v rsync >/dev/null || sudo dnf install -y rsync"
+
+      - name: Upload backend + frontend
         env:
           EC2_USER: ${{ secrets.EC2_USER }}
           EC2_HOST: ${{ secrets.EC2_HOST }}
@@ -79,7 +230,7 @@ jobs:
           SSH="ssh -i ~/.ssh/id_rsa"
           rsync -az --delete -e "$SSH" \
             --exclude node_modules --exclude .env \
-            backend/ "$EC2_USER@$EC2_HOST:$APP_DIR/backend/"
+            src/backend/ "$EC2_USER@$EC2_HOST:$APP_DIR/backend/"
           rsync -az --delete -e "$SSH" \
             frontend/dist/ "$EC2_USER@$EC2_HOST:$APP_DIR/frontend/dist/"
 
@@ -91,7 +242,7 @@ jobs:
           ssh -i ~/.ssh/id_rsa "$EC2_USER@$EC2_HOST" 'bash -s' <<'REMOTE'
           set -euo pipefail
           cd /var/www/fooddash/backend
-          [ -f .env ] || { echo "ERROR: backend/.env missing on server" >&2; exit 1; }
+          [ -f .env ] || { echo "ERROR: backend/.env missing. Run workflow manually with setup_server ticked." >&2; exit 1; }
 
           if [ -f package-lock.json ]; then npm ci --omit=dev; else npm install --omit=dev; fi
 
@@ -115,8 +266,39 @@ jobs:
           exit 1
           REMOTE
 
-      - name: Public health check
+  # ------------------------------------------------------------------
+  init-database:
+    name: One-time DB migrate + seed (manual)
+    needs: deploy
+    if: ${{ inputs.init_database }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Set up SSH
         env:
+          EC2_SSH_KEY: ${{ secrets.EC2_SSH_KEY }}
+          EC2_HOST: ${{ secrets.EC2_HOST }}
+        run: |
+          mkdir -p ~/.ssh
+          printf '%s\n' "$EC2_SSH_KEY" > ~/.ssh/id_rsa
+          chmod 600 ~/.ssh/id_rsa
+          ssh-keyscan -H "$EC2_HOST" >> ~/.ssh/known_hosts
+
+      - name: Migrate + seed
+        env:
+          EC2_USER: ${{ secrets.EC2_USER }}
+          EC2_HOST: ${{ secrets.EC2_HOST }}
+        run: |
+          ssh -i ~/.ssh/id_rsa "$EC2_USER@$EC2_HOST" \
+            "cd $APP_DIR/backend && npm run migrate && npm run seed"
+
+  # ------------------------------------------------------------------
+  verify:
+    name: Public health check
+    needs: [deploy, init-database]
+    if: ${{ !cancelled() && needs.deploy.result == 'success' && (needs.init-database.result == 'success' || needs.init-database.result == 'skipped') }}
+    runs-on: ubuntu-latest
+    steps:
+      - env:
           EC2_HOST: ${{ secrets.EC2_HOST }}
         run: |
           for i in $(seq 1 10); do
