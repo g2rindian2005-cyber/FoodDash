@@ -1,0 +1,108 @@
+name: CI/CD - Deploy FoodDash to AWS EC2
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: deploy-production
+  cancel-in-progress: false
+
+env:
+  APP_DIR: /var/www/fooddash
+
+jobs:
+  build:
+    name: Build & test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: |
+            backend/package-lock.json
+            frontend/package-lock.json
+
+      - name: Install backend deps
+        working-directory: backend
+        run: npm ci
+
+      - name: Backend syntax check
+        working-directory: backend
+        run: |
+          for f in $(find src -name '*.js'); do node --check "$f"; done
+
+      - name: Install & build frontend
+        working-directory: frontend
+        env:
+          VITE_API_URL: /api
+        run: |
+          npm ci
+          npm run build
+
+      - name: Upload frontend build
+        uses: actions/upload-artifact@v4
+        with:
+          name: frontend-dist
+          path: frontend/dist
+          if-no-files-found: error
+
+  deploy:
+    name: Deploy to EC2
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download frontend build
+        uses: actions/download-artifact@v4
+        with:
+          name: frontend-dist
+          path: frontend/dist
+
+      - name: Set up SSH
+        env:
+          EC2_SSH_KEY: ${{ secrets.EC2_SSH_KEY }}
+          EC2_HOST: ${{ secrets.EC2_HOST }}
+        run: |
+          mkdir -p ~/.ssh
+          printf '%s\n' "$EC2_SSH_KEY" > ~/.ssh/id_rsa
+          chmod 600 ~/.ssh/id_rsa
+          ssh-keyscan -H "$EC2_HOST" >> ~/.ssh/known_hosts
+
+      - name: Upload files to EC2
+        env:
+          EC2_USER: ${{ secrets.EC2_USER }}
+          EC2_HOST: ${{ secrets.EC2_HOST }}
+        run: |
+          SSH="ssh -i ~/.ssh/id_rsa -o StrictHostKeyChecking=yes"
+          # backend (never touch server-side .env or node_modules)
+          rsync -az --delete -e "$SSH" \
+            --exclude node_modules --exclude .env \
+            backend/ "$EC2_USER@$EC2_HOST:$APP_DIR/backend/"
+          # built frontend
+          rsync -az --delete -e "$SSH" \
+            frontend/dist/ "$EC2_USER@$EC2_HOST:$APP_DIR/frontend/dist/"
+          # deploy helpers
+          rsync -az -e "$SSH" deploy/ "$EC2_USER@$EC2_HOST:$APP_DIR/deploy/"
+
+      - name: Install deps & restart API
+        env:
+          EC2_USER: ${{ secrets.EC2_USER }}
+          EC2_HOST: ${{ secrets.EC2_HOST }}
+        run: |
+          ssh -i ~/.ssh/id_rsa "$EC2_USER@$EC2_HOST" "bash $APP_DIR/deploy/remote-deploy.sh"
+
+      - name: Public health check
+        env:
+          EC2_HOST: ${{ secrets.EC2_HOST }}
+        run: |
+          for i in $(seq 1 10); do
+            if curl -fsS "http://$EC2_HOST/api/health"; then echo; echo "Deployed OK"; exit 0; fi
+            echo "Waiting for app ($i/10)..."; sleep 5
+          done
+          echo "Health check failed"; exit 1
